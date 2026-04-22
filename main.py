@@ -1,16 +1,19 @@
 # main.py
 import logging
+import os
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from telegram import Update  # ← ESTE IMPORT FALTABA
 
 from handlers.mercadopago import procesar_webhook_mp
 from handlers.brubank import procesar_notificacion_brubank
 from database import init_db, registrar_cobro
 from reportes import enviar_reporte_semanal
-from config import SUCURSALES
+from config import SUCURSALES, ADMIN_TOKEN
+from telegram_bot import iniciar_bot, shutdown_bot
 
 # ── Logging ──────────────────────────────────────────────
 logging.basicConfig(
@@ -20,30 +23,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── App ───────────────────────────────────────────────────
-app = FastAPI(title="Verduleria Bot — AVC", version="1.0.0")
+app = FastAPI(title="Verduleria Bot — AVC", version="2.0.0")
 
 # ── Scheduler para reportes ───────────────────────────────
 scheduler = AsyncIOScheduler()
-# ... (imports anteriores)
 
-# ── Endpoint Admin: Forzar Reporte ─────────────────────────
-@app.post("/admin/reporte")
-async def forzar_reporte(request: Request):
-    """
-    Endpoint protegido para testear el reporte semanal manualmente.
-    Enviar header: X-Admin-Token: TU_TOKEN_SECRETO
-    """
-    # Validación simple por header (en producción usar auth real)
-    admin_token = request.headers.get("X-Admin-Token", "")
-    if admin_token != os.getenv("ADMIN_TOKEN", "admin123"):
-        raise HTTPException(status_code=401, detail="Token inválido")
-    
-    resultado = await enviar_reporte_semanal(forzar=True)
-    return resultado
-
-
-# ... (resto del código)
-
+# ── Bot de Telegram ───────────────────────────────────────
+telegram_app = None
 
 
 async def iniciar_scheduler():
@@ -57,10 +43,45 @@ async def iniciar_scheduler():
     logger.info("Scheduler de reportes iniciado")
 
 
+async def iniciar_telegram_bot():
+    """Inicia el bot de Telegram en segundo plano."""
+    global telegram_app
+    telegram_app = iniciar_bot()
+    await telegram_app.initialize()
+    await telegram_app.start()
+    await telegram_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+    logger.info("Bot de Telegram iniciado")
+
+
+async def cerrar_telegram_bot():
+    """Cierra el bot de Telegram correctamente."""
+    global telegram_app
+    if telegram_app:
+        await telegram_app.updater.stop()
+        await telegram_app.stop()
+        await telegram_app.shutdown()
+    logger.info("Bot de Telegram apagado")
+
+
 # ── Health check ─────────────────────────────────────────
 @app.get("/")
 async def health():
-    return {"status": "online", "servicio": "Bot de Cobros"}
+    return {"status": "online", "servicio": "Bot de Cobros AVC"}
+
+
+# ── Endpoint Admin: Forzar Reporte ─────────────────────────
+@app.post("/admin/reporte")
+async def forzar_reporte(request: Request):
+    """
+    Endpoint protegido para testear el reporte semanal manualmente.
+    Enviar header: X-Admin-Token: TU_TOKEN_SECRETO
+    """
+    admin_token = request.headers.get("X-Admin-Token", "")
+    if admin_token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="Token inválido")
+    
+    resultado = await enviar_reporte_semanal(forzar=True)
+    return resultado
 
 
 # ── Webhooks Mercado Pago ─────────────────────────────────
@@ -130,9 +151,19 @@ async def test_alerta(sucursal_key: str, request: Request):
 async def startup_event():
     await init_db()
     await iniciar_scheduler()
+    await iniciar_telegram_bot()
+    logger.info("✅ Sistema completo iniciado")
+
+
+# ── Shutdown Event ────────────────────────────────────────
+@app.on_event("shutdown")
+async def shutdown_event():
+    await cerrar_telegram_bot()
+    scheduler.shutdown()
+    logger.info("🛑 Sistema apagado correctamente")
 
 
 # ── Entry point ───────────────────────────────────────────
 if __name__ == "__main__":
     from config import PORT
-    uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=False)

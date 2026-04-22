@@ -57,3 +57,72 @@ async def obtener_cobros_semanales() -> dict:
         "total": row["total"] or 0,
         "cantidad": row["cantidad"] or 0
     } for row in resultados}
+
+
+# ── NUEVAS FUNCIONES PARA EL BOT DE TELEGRAM ──────────────────
+
+async def obtener_ultimo_cobro() -> dict | None:
+    """Obtiene el último cobro registrado."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("""
+            SELECT sucursal_nombre, monto, fuente, fecha_hora
+            FROM cobros
+            ORDER BY fecha_hora DESC
+            LIMIT 1
+        """)
+        resultado = await cursor.fetchone()
+    
+    if resultado:
+        return {
+            "sucursal_nombre": resultado["sucursal_nombre"],
+            "monto": resultado["monto"],
+            "fuente": resultado["fuente"],
+            "fecha_hora": resultado["fecha_hora"]
+        }
+    return None
+
+
+async def buscar_cobro_por_monto(monto: float, minutos: int = 30) -> dict | None:
+    """Busca un cobro por monto en los últimos X minutos."""
+    fecha_limite = datetime.now() - timedelta(minutes=minutos)
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("""
+            SELECT sucursal_nombre, monto, fuente, fecha_hora
+            FROM cobros
+            WHERE monto = ? AND fecha_hora >= ?
+            ORDER BY fecha_hora DESC
+            LIMIT 1
+        """, (monto, fecha_limite.isoformat()))
+        resultado = await cursor.fetchone()
+    
+    if resultado:
+        return {
+            "sucursal_nombre": resultado["sucursal_nombre"],
+            "monto": resultado["monto"],
+            "fuente": resultado["fuente"],
+            "fecha_hora": resultado["fecha_hora"]
+        }
+    return None
+
+
+async def obtener_total_dia() -> dict:
+    """Obtiene el total cobrado en el día actual."""
+    hoy = datetime.now().date()
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("""
+            SELECT SUM(monto) as monto, COUNT(*) as cantidad
+            FROM cobros
+            WHERE DATE(fecha_hora) = ?
+        """, (hoy.isoformat(),))
+        resultado = await cursor.fetchone()
+    
+    return {
+        "monto": resultado["monto"] or 0,
+        "cantidad": resultado["cantidad"] or 0,
+        "fecha": datetime.now().strftime("%d/%m/%Y %H:%M")
+    }
