@@ -18,14 +18,22 @@ PATRONES_MONTO = [
 
 
 def _extraer_monto(texto_notificacion: str) -> float | None:
-    """Intenta extraer el monto del texto de la notificación de Brubank."""
     for patron in PATRONES_MONTO:
         match = re.search(patron, texto_notificacion, re.IGNORECASE)
         if match:
             monto_str = match.group(1)
-            # Normalizar separadores: "1.200,50" → "1200.50"
-            monto_str = monto_str.replace(".", "").replace(",", ".")
             try:
+                if "," in monto_str:
+                    # Formato argentino: 1.200,50
+                    monto_str = monto_str.replace(".", "").replace(",", ".")
+                else:
+                    # Sin comas: 1200 o 1200.50 (punto decimal)
+                    # Solo sacar puntos de miles si hay más de 3 dígitos antes
+                    partes = monto_str.split(".")
+                    if len(partes) == 2 and len(partes[1]) == 3:
+                        # Es separador de miles: 1.200 → 1200
+                        monto_str = monto_str.replace(".", "")
+                    # Si no, dejarlo como está (1200.50 sigue siendo 1200.50)
                 return float(monto_str)
             except ValueError:
                 continue
