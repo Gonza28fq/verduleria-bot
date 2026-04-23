@@ -1,8 +1,10 @@
+# handlers/mercadopago.py
 import logging
 import hashlib
 import hmac
 from datetime import datetime
 import httpx
+import os
 from fastapi import Request, HTTPException
 
 from config import SUCURSALES, MP_WEBHOOK_SECRET, MONTO_MINIMO
@@ -14,7 +16,7 @@ logger = logging.getLogger(__name__)
 def _encontrar_sucursal_por_token(access_token: str):
     """Busca qué sucursal corresponde a un access token de MP."""
     for key, datos in SUCURSALES.items():
-        if datos["mp_access_token"] == access_token:
+        if datos.get("mp_access_token") == access_token:
             return key, datos
     return None, None
 
@@ -22,12 +24,17 @@ def _encontrar_sucursal_por_token(access_token: str):
 async def _obtener_detalle_pago(payment_id: str, access_token: str) -> dict | None:
     """Consulta la API de MP para obtener el detalle del pago."""
     url = f"https://api.mercadopago.com/v1/payments/{payment_id}"
-    headers = {"Authorization": f"Bearer {access_token}"}
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
+    }
 
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.get(url, headers=headers, timeout=10)
-            resp.raise_for_status()
+            if resp.status_code != 200:
+                logger.warning(f"MP API devolvió {resp.status_code} para payment {payment_id}")
+                return None
             return resp.json()
         except Exception as e:
             logger.error(f"Error consultando pago {payment_id}: {e}")
@@ -37,7 +44,6 @@ async def _obtener_detalle_pago(payment_id: str, access_token: str) -> dict | No
 def _validar_firma(request_body: bytes, firma_header: str) -> bool:
     """Valida que el webhook realmente proviene de Mercado Pago."""
     if not MP_WEBHOOK_SECRET or MP_WEBHOOK_SECRET == "TU_SECRET_AQUI":
-        # Sin secret configurado se omite validación (solo para desarrollo)
         logger.warning("Webhook secret no configurado — saltando validación de firma")
         return True
 
@@ -46,56 +52,85 @@ def _validar_firma(request_body: bytes, firma_header: str) -> bool:
         request_body,
         hashlib.sha256
     ).hexdigest()
+    
+    if not firma_header:
+        logger.warning("No se recibió firma en el header")
+        return False
+    
     return hmac.compare_digest(expected, firma_header or "")
 
 
 async def procesar_webhook_mp(request: Request, sucursal_key: str):
     """
     Endpoint principal del webhook de Mercado Pago.
-    MP llama a esta URL cuando entra un pago.
-    URL sugerida: POST /webhook/mp/{sucursal_key}
     """
-    body = await request.body()
-    firma = request.headers.get("x-signature", "")
+    try:
+        body = await request.body()
+        firma = request.headers.get("x-signature", "")
 
-    if not _validar_firma(body, firma):
-        logger.warning("Firma inválida en webhook MP")
-        raise HTTPException(status_code=401, detail="Firma inválida")
+        if not _validar_firma(body, firma):
+            logger.warning("Firma inválida en webhook MP")
+            raise HTTPException(status_code=401, detail="Firma inválida")
 
-    datos = await request.json()
-    logger.info(f"Webhook MP recibido para {sucursal_key}: {datos}")
+        datos = await request.json()
+        logger.info(f"Webhook MP recibido para {sucursal_key}: {datos}")
 
-    # MP manda varios tipos de eventos, solo nos interesan los pagos
-    if datos.get("type") != "payment":
-        return {"status": "ignorado", "motivo": "evento no es payment"}
+        # MP puede enviar "type" o "action" dependiendo del evento
+        evento_type = datos.get("type") or datos.get("action", "")
+        
+        # Solo procesar eventos de payment
+        if "payment" not in evento_type.lower():
+            logger.info(f"Evento '{evento_type}' no es de pago — ignorado")
+            return {"status": "ignorado", "motivo": f"evento: {evento_type}"}
 
-    payment_id = str(datos.get("data", {}).get("id", ""))
-    if not payment_id:
-        raise HTTPException(status_code=400, detail="ID de pago no encontrado")
+        payment_id = str(datos.get("data", {}).get("id", ""))
+        if not payment_id or payment_id == "123456":
+            # ID de prueba de MP, no es un pago real
+            logger.info("Payment ID de prueba detectado — ignorado")
+            return {"status": "ok", "motivo": "test payment ignorado"}
 
-    sucursal_datos = SUCURSALES.get(sucursal_key)
-    if not sucursal_datos:
-        raise HTTPException(status_code=404, detail="Sucursal no encontrada")
+        sucursal_datos = SUCURSALES.get(sucursal_key)
+        if not sucursal_datos:
+            logger.error(f"Sucursal {sucursal_key} no encontrada")
+            raise HTTPException(status_code=404, detail="Sucursal no encontrada")
 
-    # Consultar detalle del pago a la API de MP
-    pago = await _obtener_detalle_pago(payment_id, sucursal_datos["mp_access_token"])
-    if not pago:
-        raise HTTPException(status_code=502, detail="No se pudo obtener el pago de MP")
+        # Verificar que la sucursal tenga token de MP
+        access_token = sucursal_datos.get("mp_access_token")
+        if not access_token:
+            logger.warning(f"Sucursal {sucursal_key} no tiene access token de MP")
+            return {"status": "ignorado", "motivo": "sin access token"}
 
-    # Solo notificar pagos aprobados
-    if pago.get("status") != "approved":
-        logger.info(f"Pago {payment_id} con estado '{pago.get('status')}' — no se notifica")
-        return {"status": "ignorado", "motivo": f"estado: {pago.get('status')}"}
+        # Consultar detalle del pago a la API de MP
+        pago = await _obtener_detalle_pago(payment_id, access_token)
+        
+        if not pago:
+            logger.warning(f"No se pudo obtener el pago {payment_id} de MP")
+            # No retornamos error 502, solo ignoramos
+            return {"status": "ok", "motivo": "pago no encontrado en MP"}
 
-    monto = float(pago.get("transaction_amount", 0))
+        # Solo notificar pagos aprobados
+        if pago.get("status") != "approved":
+            logger.info(f"Pago {payment_id} con estado '{pago.get('status')}' — no se notifica")
+            return {"status": "ignorado", "motivo": f"estado: {pago.get('status')}"}
 
-    if monto < MONTO_MINIMO:
-        logger.info(f"Pago de ${monto} menor al mínimo ${MONTO_MINIMO} — no se notifica")
-        return {"status": "ignorado", "motivo": "monto menor al mínimo"}
+        monto = float(pago.get("transaction_amount", 0))
 
-    hora = datetime.now().strftime("%H:%M")
-    mensaje = formatear_cobro(sucursal_datos["nombre"], monto, "Mercado Pago", hora)
+        if monto < MONTO_MINIMO:
+            logger.info(f"Pago de ${monto} menor al mínimo — no se notifica")
+            return {"status": "ignorado", "motivo": "monto menor al mínimo"}
 
-    await enviar_alerta(sucursal_datos["chat_id"], mensaje)
+        hora = datetime.now().strftime("%H:%M")
+        mensaje = formatear_cobro(sucursal_datos["nombre"], monto, "Mercado Pago", hora)
 
-    return {"status": "ok", "payment_id": payment_id, "monto": monto}
+        await enviar_alerta(sucursal_datos["chat_id"], mensaje)
+        
+        logger.info(f"Pago notificado: ${monto} - {sucursal_datos['nombre']}")
+
+        return {"status": "ok", "payment_id": payment_id, "monto": monto}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error procesando webhook MP: {e}")
+        # Retornamos 200 OK para que MP no reintente constantemente
+        return {"status": "error", "detalle": str(e)}
