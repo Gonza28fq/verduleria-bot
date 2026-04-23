@@ -6,7 +6,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-from telegram import Update  # ← ESTE IMPORT FALTABA
+from telegram import Update
 
 from handlers.mercadopago import procesar_webhook_mp
 from handlers.brubank import procesar_notificacion_brubank
@@ -25,15 +25,12 @@ logger = logging.getLogger(__name__)
 # ── App ───────────────────────────────────────────────────
 app = FastAPI(title="Verduleria Bot — AVC", version="2.0.0")
 
-# ── Scheduler para reportes ───────────────────────────────
+# ── Scheduler ────────────────────────────────────────────
 scheduler = AsyncIOScheduler()
-
-# ── Bot de Telegram ───────────────────────────────────────
 telegram_app = None
 
 
 async def iniciar_scheduler():
-    """Programa el reporte semanal (todos los lunes a las 9:00)."""
     scheduler.add_job(
         enviar_reporte_semanal,
         CronTrigger(day_of_week='mon', hour=9, minute=0),
@@ -44,7 +41,6 @@ async def iniciar_scheduler():
 
 
 async def iniciar_telegram_bot():
-    """Inicia el bot de Telegram en segundo plano."""
     global telegram_app
     telegram_app = iniciar_bot()
     await telegram_app.initialize()
@@ -54,7 +50,6 @@ async def iniciar_telegram_bot():
 
 
 async def cerrar_telegram_bot():
-    """Cierra el bot de Telegram correctamente."""
     global telegram_app
     if telegram_app:
         await telegram_app.updater.stop()
@@ -69,13 +64,23 @@ async def health():
     return {"status": "online", "servicio": "Bot de Cobros AVC"}
 
 
-# ── Endpoint Admin: Forzar Reporte ─────────────────────────
+# ── Endpoint DEBUG (Para verificar que llega el request) ───
+@app.post("/webhook/mp/debug/{sucursal_key}")
+async def webhook_mp_debug(sucursal_key: str, request: Request):
+    """Endpoint sin validación para debug."""
+    try:
+        logger.info(f"🔍 DEBUG: Request recibido para {sucursal_key}")
+        datos = await request.json()
+        logger.info(f"🔍 DEBUG: Datos: {datos}")
+        return {"status": "ok", "received": datos, "sucursal": sucursal_key}
+    except Exception as e:
+        logger.error(f"🔍 DEBUG Error: {e}")
+        return {"status": "error", "detalle": str(e)}
+
+
+# ── Endpoint Admin ─────────────────────────────────────────
 @app.post("/admin/reporte")
 async def forzar_reporte(request: Request):
-    """
-    Endpoint protegido para testear el reporte semanal manualmente.
-    Enviar header: X-Admin-Token: TU_TOKEN_SECRETO
-    """
     admin_token = request.headers.get("X-Admin-Token", "")
     if admin_token != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="Token inválido")
@@ -87,39 +92,47 @@ async def forzar_reporte(request: Request):
 # ── Webhooks Mercado Pago ─────────────────────────────────
 @app.post("/webhook/mp/{sucursal_key}")
 async def webhook_mp(sucursal_key: str, request: Request):
-    resultado = await procesar_webhook_mp(request, sucursal_key)
-    
-    # Registrar en DB si el pago fue exitoso
-    if resultado.get("status") == "ok" and resultado.get("monto"):
-        sucursal = SUCURSALES.get(sucursal_key)
-        await registrar_cobro(
-            sucursal_key=sucursal_key,
-            sucursal_nombre=sucursal["nombre"],
-            monto=resultado["monto"],
-            fuente="Mercado Pago",
-            payment_id=resultado.get("payment_id")
-        )
-    
-    return resultado
+    logger.info(f"📩 Webhook MP recibido para {sucursal_key}")
+    try:
+        resultado = await procesar_webhook_mp(request, sucursal_key)
+        
+        if resultado.get("status") == "ok" and resultado.get("monto"):
+            sucursal = SUCURSALES.get(sucursal_key)
+            await registrar_cobro(
+                sucursal_key=sucursal_key,
+                sucursal_nombre=sucursal["nombre"],
+                monto=resultado["monto"],
+                fuente="Mercado Pago",
+                payment_id=resultado.get("payment_id")
+            )
+        
+        return resultado
+    except Exception as e:
+        logger.error(f"Error en webhook_mp: {e}")
+        return {"status": "error", "detalle": str(e)}
 
 
-# ── Endpoint Brubank (MacroDroid) ─────────────────────────
+# ── Endpoint Brubank ──────────────────────────────────────
 @app.post("/webhook/brubank/{sucursal_key}")
 async def webhook_brubank(sucursal_key: str, request: Request):
-    resultado = await procesar_notificacion_brubank(request, sucursal_key)
-    
-    # Registrar en DB si el cobro fue exitoso
-    if resultado.get("status") == "ok" and resultado.get("monto"):
-        sucursal = SUCURSALES.get(sucursal_key)
-        await registrar_cobro(
-            sucursal_key=sucursal_key,
-            sucursal_nombre=sucursal["nombre"],
-            monto=resultado["monto"],
-            fuente="Brubank",
-            payment_id=None
-        )
-    
-    return resultado
+    logger.info(f"📩 Webhook Brubank recibido para {sucursal_key}")
+    try:
+        resultado = await procesar_notificacion_brubank(request, sucursal_key)
+        
+        if resultado.get("status") == "ok" and resultado.get("monto"):
+            sucursal = SUCURSALES.get(sucursal_key)
+            await registrar_cobro(
+                sucursal_key=sucursal_key,
+                sucursal_nombre=sucursal["nombre"],
+                monto=resultado["monto"],
+                fuente="Brubank",
+                payment_id=None
+            )
+        
+        return resultado
+    except Exception as e:
+        logger.error(f"Error en webhook_brubank: {e}")
+        return {"status": "error", "detalle": str(e)}
 
 
 # ── Endpoint de prueba ───────────────────────────────────
@@ -140,7 +153,6 @@ async def test_alerta(sucursal_key: str, request: Request):
     mensaje = formatear_cobro(sucursal["nombre"], monto, fuente, hora)
     await enviar_alerta(sucursal["chat_id"], mensaje)
     
-    # Registrar en DB también
     await registrar_cobro(sucursal_key, sucursal["nombre"], monto, fuente, None)
 
     return {"status": "ok", "mensaje_enviado": mensaje}
