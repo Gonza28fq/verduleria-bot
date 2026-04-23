@@ -188,6 +188,9 @@ async def test_alerta(sucursal_key: str, request: Request):
 
 
 # ── Entry point ───────────────────────────────────────────
+# ── Entry point ───────────────────────────────────────────
 if __name__ == "__main__":
-    from config import PORT
-    uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=False)
+    import os
+    # Railway asigna el puerto en runtime, usar directamente del entorno
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
