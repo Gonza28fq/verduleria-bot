@@ -67,10 +67,18 @@ async def procesar_webhook_mp(request: Request, sucursal_key: str):
     try:
         body = await request.body()
         firma = request.headers.get("x-signature", "")
+        
+        # DEBUG: Loguear headers y body para ver qué llega
+        logger.info(f"🔍 Headers recibidos: {dict(request.headers)}")
+        logger.info(f"🔍 Body recibido: {body}")
+        logger.info(f"🔍 Firma del header: {firma}")
+        logger.info(f"🔍 Secret configurado: {MP_WEBHOOK_SECRET[:10]}..." if MP_WEBHOOK_SECRET else "No configurado")
 
         if not _validar_firma(body, firma):
             logger.warning("Firma inválida en webhook MP")
             raise HTTPException(status_code=401, detail="Firma inválida")
+        
+        # ... resto del código
 
         datos = await request.json()
         logger.info(f"Webhook MP recibido para {sucursal_key}: {datos}")
